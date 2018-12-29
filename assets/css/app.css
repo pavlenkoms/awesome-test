@@ -1,0 +1,47 @@
+/* This file is for your main application css. */
+
+body {
+  font-size: 18px;
+  line-height: 1.5;
+  padding: 5px 20px;
+  color: #000
+}
+
+@media (min-width:800px) {
+  body {
+    padding: 40px 20px 120px
+  }
+}
+
+a:link {
+  color: blue
+}
+
+a:visited {
+  color: #639
+}
+
+h1 {
+  font-size: 2em
+}
+
+h2 {
+  font-size: 1.8em
+}
+
+h3 {
+  font-size: 1.6em
+}
+
+li {
+  margin-left: 0;
+  margin-top: 0;
+  margin-bottom: 0;
+  line-height: 1.4
+}
+
+ul {
+  margin-top: 0;
+  margin-bottom: 0;
+  line-height: 1.4
+}
