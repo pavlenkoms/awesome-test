@@ -1,21 +1,3 @@
 <h2>Contents</h2>
-<% chapters = to_sort_list(assigns.data) %>
-<%= for chapter <- chapters do %>
-  <li>
-    <a href="#<%= chapter["reference"] %>"><%= chapter["name"] %></a>
-  </li>
-<% end %>
 
-<%= for chapter <- chapters do %>
-  <h2 id="<%= chapter["reference"] %>"><%= chapter["name"] %></h2>
-    <p><%= chapter["description"] |> as_html() %></p>
-    <%= for project <- to_sort_list(chapter["projects"]) do %>
-      <ul>
-        <li >
-          <a href="<%= project["link"] %>"><%= project["name"] %></a>
-            ⭐<sub><%= project["stars"] %></sub> 📅<sub><%= days_off(project) %></sub>
-            —&nbsp<%= project["description"] %>
-        </li>
-      </ul>
-    <% end %>
-<% end %>
+<%= as_html(@data) %>

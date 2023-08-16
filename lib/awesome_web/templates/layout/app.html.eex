@@ -44,7 +44,7 @@
     </header>
 
     <main>
-      <%= unless map_size(assigns.data) == 0 do %>
+      <%= unless assigns.data == "" do %>
         <%= render @view_module, @view_template, assigns %>
       <% else %>
         <p> Nothing to show</p>

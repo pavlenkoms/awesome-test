@@ -1,74 +1,46 @@
 defmodule Awesome.Fetcher do
+  # я не знаю что я обожаю больше. Парсить и модифицировать строки или же
+  # работать с глубоко-вложенными структурами данных
   use GenServer
 
   require Logger
 
+  alias Awesome.Fetcher.Github
+  alias Awesome.Fetcher.Processor
+  alias Awesome.Fetcher.PersistCache
 
-  # Ошибка раз: без экты. С эктой структура данных была бы прозрачнее, и код
-  # читаемее, т.к. реляции в структуре листа приложений просматриваются ну очень
-  # явно + было бы возможно слегка кофортнее тестить.
-  # Ошибка два: детска не самый лучший вариант в принципе, но для таких микро
-  # проектов сканает. Как альтернативу было бы гуд юзать какую нить опять же
-  # постгрю под эктой али редис какой
-
-
-  @api_link "https://api.github.com/repos/"
-  @awesome_path Application.get_env(:awesome, __MODULE__)[:awesome_path]
-  @readme Application.get_env(:awesome, __MODULE__)[:readme]
-
-  @last_commit "/commits/master"
+  @awesome_path Application.compile_env(:awesome, __MODULE__)[:awesome_path]
+  @readme Application.compile_env(:awesome, __MODULE__)[:readme]
 
   @update_interval 24 * 60 * 60 * 1000
   @data_key :awesome
-
-  @user Application.get_env(:awesome, __MODULE__)[:username]
-  @password Application.get_env(:awesome, __MODULE__)[:password]
-  @basic_auth (@user && [basic_auth: {@user, @password}]) || []
-  @pool_name :awesome_pool
   @awesome_storage :awesome_storage
 
-  def get_data() do
+  def get_data(params) do
     case :ets.lookup(@awesome_storage, @data_key) do
-      [] -> %{}
-      [{@data_key, data}] -> data
+      [] ->
+        :not_found
+
+      [{@data_key, data}] ->
+        data =
+          data
+          |> filter_data(params)
+          |> compile_ast()
+
+        {:ok, data}
     end
   end
 
   def start_link(_) do
     args = [
       @awesome_storage,
-      :links_table,
-      Application.get_env(:awesome, Awesome.Fetcher)[:links_dets],
-      @pool_name
+      Application.get_env(:awesome_megafon, __MODULE__)[:cache_file]
     ]
 
-    start_link(args, Mix.env())
-  end
-
-  # Говно. Но пресловутый автоапдейт
-  def start_link(_, :test) do
-    {
-      :ok,
-      spawn_link(fn ->
-        receive do
-          _ ->
-            :ok
-        end
-      end)
-    }
-  end
-
-  def start_link(args, _) do
     GenServer.start_link(__MODULE__, args, name: __MODULE__)
   end
 
-  def start_link(ets_name, links_table, links_dets, pool_name) do
-    GenServer.start_link(__MODULE__, [ets_name, links_table, links_dets, pool_name])
-  end
-
-  def init([ets_name, links_table, links_dets, pool_name]) do
-    options = [{:timeout, 150_000}, {:max_connections, 6}]
-    :ok = :hackney_pool.start_pool(pool_name, options)
+  def init([ets_name, cache_file]) do
     storage = :ets.new(ets_name, [:set, :protected, :named_table])
 
     send(self(), :refresh)
@@ -76,282 +48,326 @@ defmodule Awesome.Fetcher do
     {:ok,
      %{
        storage: storage,
-       iteration: 0,
-       links_table: links_table,
-       links_dets: links_dets,
-       pool_name: pool_name
+       cache_file: cache_file
      }}
   end
 
   def handle_info(:refresh, state) do
-    {:ok, _} = :dets.open_file(state.links_table, file: state.links_dets)
+    # для персиста использовал детс, т.к. тащить что то еще было лень
+    {:ok, cache} = PersistCache.create(state.cache_file)
 
-    iteration =
-      case :dets.lookup(state.links_table, :iteration) do
-        [{:iteration, iter}] ->
-          iter
+    try do
+      with {:ok, body} <- Github.Adapter.request(@awesome_path <> @readme, cache),
+           {:ok, readme} <- Base.decode64(body["content"], ignore: :whitespace),
+           {markdown_ast, errors} <- parse_readme(readme, cache),
+           :ok <- PersistCache.collect_garbage(cache),
+           true <- :ets.insert(state.storage, {@data_key, markdown_ast}) do
+        send_refresh(errors)
+      else
+        {:error, :rate_limit, reset} ->
+          timeout = calculate_limit_timeout(reset)
 
-        _ ->
-          :dets.insert(state.links_table, {:iteration, state.iteration})
-          0
+          Logger.error("ratelimit, waiting #{timeout / 1000} secs...")
+
+          :timer.send_after(timeout, :refresh)
+
+        err ->
+          Logger.error("Something goes wrong #{inspect(err)}")
+          :timer.send_after(10000, :refresh)
       end
+    rescue
+      error ->
+        Logger.error(Exception.format(:error, error, __STACKTRACE__))
+        send_refresh([])
+    end
 
-    state = %{state | iteration: iteration}
+    PersistCache.close(cache)
 
-    with {:ok, body} <- do_http_request(@api_link <> @awesome_path <> @readme, state),
-         # тут бы по хорошему надо определять тип
-         # контетна, но чето как то лень. Пусть будеть base64 всегда.
-         {:ok, readme} <- Base.decode64(body["content"], ignore: :whitespace),
-         {:ok, data} <- parse_readme(readme, state),
-         :ok <- links_garbage_collect(state),
-         true <- :ets.insert(state.storage, {@data_key, data}) do
-      :timer.send_after(@update_interval, :refresh)
-      iteration = :dets.update_counter(state.links_table, :iteration, {2, 1})
-      :dets.sync(state.links_table)
-      :dets.close(state.links_table)
+    {:noreply, state}
+  end
 
-      {:noreply, %{state | iteration: iteration}}
-    else
-      {:error, :x_rate_limit, reset} ->
-        now = DateTime.utc_now() |> DateTime.to_unix()
-        diff = reset - now
+  defp send_refresh([]), do: :timer.send_after(@update_interval, :refresh)
 
-        timeout =
-          cond do
-            diff < 0 -> 1000
-            true -> diff * 1000
-          end
-
-        Logger.error("X-rate-limit, waiting #{timeout / 1000} secs...")
-
-        :timer.send_after(timeout, :refresh)
-        {:noreply, state}
-
-      err ->
-        :timer.sleep(3000)
-        Logger.error("Something goes wrong #{inspect(err)}")
+  defp send_refresh(errors) do
+    errors
+    |> Enum.filter(fn
+      {:error, :rate_limit, _} -> true
+      _ -> false
+    end)
+    |> case do
+      [] ->
         :timer.send_after(10000, :refresh)
-        {:noreply, state}
+
+      [{:error, :rate_limit, reset} | _] ->
+        timeout = calculate_limit_timeout(reset)
+        Logger.error("ratelimit, waiting #{timeout / 1000} secs...")
+        :timer.send_after(timeout, :refresh)
     end
   end
 
-  defp parse_readme(readme, state) do
-    regexp = ~r/- \[Awesome Elixir\]\(#awesome-elixir\)\n(?<chapters>[\s\S]*?)\n(- \[|\n)/
+  defp calculate_limit_timeout(reset) do
+    now = DateTime.utc_now() |> DateTime.to_unix()
+    diff = reset - now
 
-    with %{"chapters" => chapter_names_string} <- Regex.named_captures(regexp, readme),
-         splitted_chapter_names <- String.split(chapter_names_string, "\n"),
-         {:ok, chapter_names} <- parse_chapters(splitted_chapter_names),
-         {:ok, chapters} <- get_chapters(chapter_names, readme),
-         {:ok, detailed_chapters} <- fetch_chapters_details(chapters, state) do
-      map = for chapter <- detailed_chapters, into: %{}, do: {chapter["name"], chapter}
-      {:ok, map}
-    end
-  end
-
-  defp parse_chapters(splitted_chapter_names) do
-    regexp = ~r/- \[(?<chapter_name>.+)\]\(#(?<chapter_ref>.+)\)/
-
-    Enum.reduce_while(splitted_chapter_names, {:ok, []}, fn str, {:ok, acc} ->
-      case Regex.named_captures(regexp, str) do
-        %{"chapter_name" => _} = capture -> {:cont, {:ok, [capture | acc]}}
-        _ -> {:halt, {:error, {:bad_chapter_name, str}}}
+    timeout =
+      cond do
+        diff < 0 -> 1000
+        true -> diff * 1000
       end
-    end)
+
+    timeout
   end
 
-  defp get_chapters(chapter_names, readme) do
-    Enum.reduce_while(chapter_names, {:ok, []}, fn chapter, {:ok, acc} ->
-      %{"chapter_name" => name, "chapter_ref" => ref} = chapter
-
-      regexp = ~r/## #{Regex.escape(name)}\n+(?<description>.*?)\n+(?<projects>(\* .+\n)+)\n+/
-
-      with %{} = captures <- Regex.named_captures(regexp, readme),
-           {:ok, projects} <- parse_projects(captures["projects"]) do
-        captures =
-          captures
-          |> Map.put("name", name)
-          |> Map.put("reference", ref)
-          |> Map.put("projects", projects)
-
-        {:cont, {:ok, [captures | acc]}}
-      else
-        nil ->
-          Logger.warn("Bad chapter format #{inspect(chapter)}")
-          {:cont, {:ok, acc}}
-
-        err ->
-          {:halt, err}
-      end
-    end)
+  defp parse_readme(readme, cache) do
+    readme
+    |> EarmarkParser.as_ast()
+    |> process_ast(cache)
   end
 
-  defp parse_projects(links) do
-    regexp = ~r/\* \[(?<name>.+)\]\((?<link>.+)\) - (?<description>.+)/
+  defp process_ast({:ok, ast, _}, cache) do
+    parse_state = %{
+      ast: ast,
+      header: [],
+      table_of_content: %{
+        wrapper: nil,
+        body: nil
+      },
+      chapters: [],
+      tail: []
+    }
 
-    links
-    |> String.split("\n")
-    |> Enum.reduce_while({:ok, []}, fn
-      "", acc ->
-        {:cont, acc}
-
-      str, {:ok, acc} ->
-        case Regex.named_captures(regexp, str) do
-          %{} = project ->
-            {:cont, {:ok, [project | acc]}}
-
-          nil ->
-            Logger.warn("Bad project format: #{inspect(str)}")
-            {:cont, {:ok, acc}}
-        end
-    end)
+    parse_state
+    |> get_header()
+    |> get_table_of_content()
+    |> get_chapters()
+    |> get_tail()
+    |> Processor.process_chapters(cache)
   end
 
-  defp fetch_chapters_details(chapters, state) do
-    Enum.reduce_while(chapters, {:ok, []}, fn chapter, {:ok, acc} ->
-      with projects <- fetch_projects_details(chapter["projects"], state),
-           :ok <- check_rate_limit(projects) do
-        projects = for project <- projects, into: %{}, do: {project["name"], project}
+  defp get_header(%{ast: ast} = state) do
+    {header, tail} =
+      Enum.split_while(ast, fn
+        {"ul", _, _, _} -> false
+        _ -> true
+      end)
 
-        acc =
-          if map_size(projects) == 0 do
-            acc
-          else
-            [Map.put(chapter, "projects", projects) | acc]
-          end
-
-        {:cont, {:ok, acc}}
-      else
-        err ->
-          {:halt, err}
-      end
-    end)
+    %{state | ast: tail, header: header}
   end
 
-  defp fetch_projects_details(projects, state) do
-    projects
-    |> Enum.map(&Task.async(fn -> fetch_project_details(&1, state) end))
-    |> Enum.flat_map(fn task ->
-      case Task.await(task, 60000) do
-        nil -> []
-        res -> [res]
-      end
-    end)
+  defp get_table_of_content(%{ast: [elem | tail]} = state) do
+    {ul_tag1, ul_attrs1, chapters, ul_meta1} = elem
+    [awesome_li | chapters_tail] = chapters
+    {li_tag, li_attrs, [awesome_link, awesome_ul], li_meta} = awesome_li
+    {ul_tag2, ul_attrs2, awesome_list, ul_meta2} = awesome_ul
+
+    awesome_li = {li_tag, li_attrs, [awesome_link, {ul_tag2, ul_attrs2, [], ul_meta2}], li_meta}
+    chapters = [awesome_li | chapters_tail]
+    elem = {ul_tag1, ul_attrs1, chapters, ul_meta1}
+
+    table_of_content = %{
+      wrapper: elem,
+      body: awesome_list
+    }
+
+    %{state | ast: tail, table_of_content: table_of_content}
   end
 
-  defp fetch_project_details(project, state) do
-    regexp = ~r/github.com\/(?<username>.+?)\/(?<project_name>.+?)($|\/.*)/
+  defp get_chapters(%{ast: ast} = state) do
+    {content, tail} =
+      Enum.split_while(ast, fn
+        {"h1", _, _, _} -> false
+        _ -> true
+      end)
 
-    with %{"username" => username, "project_name" => project_name} <-
-           Regex.named_captures(regexp, project["link"]),
-         {:ok, project} <- get_project_miscs(project, username, project_name, state) do
-      project
-    else
-      {:error, :x_rate_limit, _} = err ->
-        err
+    chapters = parse_content(content, [])
+
+    %{state | ast: tail, chapters: chapters}
+  end
+
+  defp get_tail(%{ast: ast} = state) do
+    %{state | ast: [], tail: ast}
+  end
+
+  defp parse_content([], list), do: list
+
+  defp parse_content(ast, list) do
+    {ast,
+     %{
+       header: nil,
+       descr: nil,
+       projects: nil
+     }}
+    |> get_content_header()
+    |> get_descr()
+    |> get_projects()
+    |> case do
+      {:ok, {ast, element}} ->
+        parse_content(ast, list ++ [element])
 
       err ->
-        Logger.warn(
-          "Something bad in fetching info for project #{project["name"]}: #{inspect(err)}\n\t#{
-            inspect(project)
-          }"
-        )
-
-        nil
+        err
     end
   end
 
-  def get_project_miscs(project, username, project_name, state) do
-    with {:ok, status} <- do_http_request(@api_link <> username <> "/" <> project_name, state),
-         {:ok, last_commit} <-
-           do_http_request(
-             @api_link <> username <> "/" <> project_name <> @last_commit,
-             state
-           ) do
-      {:ok, last_commit_date, _} =
-        last_commit
-        |> get_in(~w(commit author date))
-        |> DateTime.from_iso8601()
+  defp get_content_header({ast, element}) do
+    ast
+    |> Enum.drop_while(fn
+      {"h2", _, _, _} -> false
+      _ -> true
+    end)
+    |> case do
+      [] ->
+        {:error, :parse_error}
 
-      seconds_off =
-        last_commit_date && DateTime.diff(DateTime.utc_now(), last_commit_date, :second)
-
-      project =
-        project
-        |> Map.put("stars", status["stargazers_count"])
-        |> Map.put("seconds_off", seconds_off)
-
-      {:ok, project}
+      [header | tail] ->
+        {:ok, {tail, %{element | header: header}}}
     end
   end
 
-  defp check_rate_limit([]), do: :ok
-  defp check_rate_limit([{:error, :x_rate_limit, _} = err | _]), do: err
-  defp check_rate_limit([_ | tail]), do: check_rate_limit(tail)
+  defp get_descr({:error, _} = error), do: error
 
-  defp do_http_request(url, state) do
-    options = [
-      hackney:
-        [
-          pool: state.pool_name,
-          follow_redirect: true,
-          checkout_timeout: 20000
-        ] ++ @basic_auth
-    ]
+  defp get_descr({:ok, {ast, element}}) do
+    ast
+    |> Enum.drop_while(fn
+      {"p", _, _, _} -> false
+      _ -> true
+    end)
+    |> case do
+      [] ->
+        {:error, :parse_error}
 
-    stored = :dets.lookup(state.links_table, url)
-    headers = make_headers(stored)
-
-    case HTTPoison.get(url, headers, options) do
-      {:ok, %{status_code: 200, body: resp_body, headers: headers}} ->
-        Logger.info("updated #{url}")
-        {_, date} = List.keyfind(headers, "Date", 0, {"Date", nil})
-        resp = Jason.decode!(resp_body)
-        :dets.insert(state.links_table, {url, resp, date, state.iteration})
-        {:ok, resp}
-
-      {:ok, %{status_code: 304}} ->
-        Logger.info("cached #{url}")
-        [{^url, resp, date, _}] = stored
-        :dets.insert(state.links_table, {url, resp, date, state.iteration})
-        {:ok, resp}
-
-      {:ok, %{status_code: 403, header: headers, body: resp_body}} ->
-        case List.keyfind(headers, "X-RateLimit-Remaining", 0) do
-          nil ->
-            {:error, resp_body}
-
-          {"X-RateLimit-Remaining", "0"} ->
-            {_, time} =
-              List.keyfind(
-                headers,
-                "X-RateLimit-Remaining",
-                0,
-                {"X-RateLimit-Remaining",
-                 DateTime.utc_now() |> DateTime.to_unix() |> Integer.to_string()}
-              )
-
-            {:error, :x_rate_limit, String.to_integer(time)}
-        end
-
-      {:ok, %{body: resp_body}} ->
-        {:error, resp_body}
-
-      {:error, %{reason: reason}} ->
-        {:error, reason}
+      [descr | tail] ->
+        {:ok, {tail, %{element | descr: descr}}}
     end
   end
 
-  defp make_headers([{_, _, date, _}]) do
-    [{"If-Modified-Since", date}]
+  defp get_projects({:error, _} = error), do: error
+
+  defp get_projects({:ok, {ast, element}}) do
+    ast
+    |> Enum.drop_while(fn
+      {"ul", _, _, _} -> false
+      _ -> true
+    end)
+    |> case do
+      [] ->
+        {:error, :parse_error}
+
+      [projects | tail] ->
+        {:ok, {tail, %{element | projects: projects}}}
+    end
   end
 
-  defp make_headers(_), do: []
+  defp compile_ast(parse_state) do
+    ast =
+      parse_state[:header] ++
+        build_table_of_content(parse_state[:table_of_content]) ++
+        build_chapters(parse_state[:chapters]) ++ parse_state[:tail]
 
-  defp links_garbage_collect(state) do
-    :dets.select_delete(state.links_table, [
-      {{:_, :_, :_, :"$1"}, [{:<, :"$1", state.iteration}], [true]}
-    ])
+    fun = fn
+      {"h" <> _, _, [h_body], _} = n ->
+        Earmark.AstTools.merge_atts_in_node(n, id: Recase.to_kebab(h_body))
 
-    :ok
+      string ->
+        string
+    end
+
+    Earmark.Transform.map_ast(ast, fun)
+  end
+
+  defp build_table_of_content(table_of_content) do
+    %{
+      wrapper: wrapper,
+      body: body
+    } = table_of_content
+
+    {ul_tag1, ul_attrs1, chapters, ul_meta1} = wrapper
+    [awesome_li | chapters_tail] = chapters
+    {li_tag, li_attrs, [awesome_link, awesome_ul], li_meta} = awesome_li
+    {ul_tag2, ul_attrs2, _, ul_meta2} = awesome_ul
+
+    awesome_li = {li_tag, li_attrs, [awesome_link, {ul_tag2, ul_attrs2, body, ul_meta2}], li_meta}
+    chapters = [awesome_li | chapters_tail]
+
+    [{ul_tag1, ul_attrs1, chapters, ul_meta1}]
+  end
+
+  defp build_chapters(chapters) do
+    chapters
+    |> Enum.flat_map(fn chapter ->
+      {h_tag, _, [h_body], meta} = chapter[:header]
+      [chapter[:header], chapter[:descr], chapter[:projects]]
+    end)
+  end
+
+  defp filter_data(parse_state, %{"min_stars" => min_stars}) do
+    min_stars =
+      case Integer.parse(min_stars) do
+        :error -> 0
+        {ms, _} -> ms
+      end
+
+    chapters = filter_projects_by_min_stars(parse_state[:chapters], min_stars)
+    {chapters_to_save, chapters_to_delete} = split_chapters(chapters)
+    table_of_content = filter_table_of_content(parse_state[:table_of_content], chapters_to_delete)
+
+    %{parse_state | table_of_content: table_of_content, chapters: chapters_to_save}
+  end
+
+  defp filter_data(parse_state, _) do
+    parse_state
+  end
+
+  defp filter_projects_by_min_stars(chapters, min_stars) do
+    Enum.reduce(chapters, [], fn chapter, acc ->
+      %{
+        projects: projects
+      } = chapter
+
+      {ul_tag, ul_attrs, lines, ul_meta} = projects
+
+      lines =
+        Enum.filter(lines, fn
+          {_, _, _, %{"stars" => stars}} ->
+            min_stars <= stars
+
+          _ ->
+            false
+        end)
+
+      projects = {ul_tag, ul_attrs, lines, ul_meta}
+
+      acc ++ [%{chapter | projects: projects}]
+    end)
+  end
+
+  defp split_chapters(chapters) do
+    Enum.split_with(chapters, fn chapter ->
+      %{
+        projects: {_ul_tag, _ul_attrs, lines, _ul_meta}
+      } = chapter
+
+      lines != []
+    end)
+  end
+
+  defp filter_table_of_content(table_of_content, chapters_to_delete) do
+    %{
+      body: body
+    } = table_of_content
+
+    chapter_names =
+      Enum.map(chapters_to_delete, fn ch ->
+        {_, _, name, _} = ch[:header]
+        name
+      end)
+
+    body =
+      Enum.filter(body, fn chapter_link ->
+        {_, _, [{_, _, name, _} | _], _} = chapter_link
+        name not in chapter_names
+      end)
+
+    %{table_of_content | body: body}
   end
 end

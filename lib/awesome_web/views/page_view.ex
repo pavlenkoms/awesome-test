@@ -2,7 +2,7 @@ defmodule AwesomeWeb.PageView do
   use AwesomeWeb, :view
 
   def as_html(txt) do
-    txt |> Earmark.as_html!(%Earmark.Options{smartypants: false}) |> raw()
+    txt |> raw()
   end
 
   def days_off(project) do

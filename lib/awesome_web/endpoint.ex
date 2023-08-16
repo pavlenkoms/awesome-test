@@ -1,9 +1,9 @@
 defmodule AwesomeWeb.Endpoint do
   use Phoenix.Endpoint, otp_app: :awesome
 
-  socket "/socket", AwesomeWeb.UserSocket,
-    websocket: true,
-    longpoll: false
+  # socket "/socket", AwesomeWeb.UserSocket,
+  #   websocket: false,
+  #   longpoll: false
 
   # Serve at "/" the static files from "priv/static" directory.
   #
@@ -17,11 +17,11 @@ defmodule AwesomeWeb.Endpoint do
 
   # Code reloading can be explicitly enabled under the
   # :code_reloader configuration of your endpoint.
-  if code_reloading? do
-    socket "/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket
-    plug Phoenix.LiveReloader
-    plug Phoenix.CodeReloader
-  end
+  # if code_reloading? do
+  #   socket "/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket
+  #   plug Phoenix.LiveReloader
+  #   plug Phoenix.CodeReloader
+  # end
 
   plug Plug.RequestId
   plug Plug.Logger

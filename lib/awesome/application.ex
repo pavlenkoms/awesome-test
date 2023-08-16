@@ -8,13 +8,24 @@ defmodule Awesome.Application do
   def start(_type, _args) do
     # List all child processes to be supervised
 
-    children = [
-      # Start the endpoint when the application starts
-      AwesomeWeb.Endpoint,
-      # Starts a worker by calling: Awesome.Worker.start_link(arg)
-      # {Awesome.Worker, arg},
-      {Awesome.Fetcher, []}
-    ]
+    children =
+      [
+        # Start the endpoint when the application starts
+        AwesomeWeb.Endpoint,
+        # Starts a worker by calling: Awesome.Worker.start_link(arg)
+        # {Awesome.Worker, arg},
+        {Finch,
+         name: Awesome.Finch,
+         pools: %{
+           :default => [size: 20]
+         }}
+      ] ++
+        if(Mix.env() in [:production, :staging, :dev],
+          do: [
+            {Awesome.Fetcher, []}
+          ],
+          else: []
+        )
 
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options

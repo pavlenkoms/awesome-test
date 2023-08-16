@@ -1,4 +1,4 @@
-use Mix.Config
+import Config
 
 # For development, we disable any cache and enable
 # debugging and code reloading.
@@ -9,7 +9,7 @@ use Mix.Config
 config :awesome, AwesomeWeb.Endpoint,
   http: [port: 4000],
   debug_errors: true,
-  code_reloader: true,
+  code_reloader: false,
   check_origin: false,
   watchers: [
     node: [
@@ -46,15 +46,15 @@ config :awesome, AwesomeWeb.Endpoint,
 # different ports.
 
 # Watch static and templates for browser reloading.
-config :awesome, AwesomeWeb.Endpoint,
-  live_reload: [
-    patterns: [
-      ~r{priv/static/.*(js|css|png|jpeg|jpg|gif|svg)$},
-      ~r{priv/gettext/.*(po)$},
-      ~r{lib/awesome_web/views/.*(ex)$},
-      ~r{lib/awesome_web/templates/.*(eex)$}
-    ]
-  ]
+# config :awesome, AwesomeWeb.Endpoint,
+#   live_reload: [
+#     patterns: [
+#       ~r{priv/static/.*(js|css|png|jpeg|jpg|gif|svg)$},
+#       ~r{priv/gettext/.*(po)$},
+#       ~r{lib/awesome_web/views/.*(ex)$},
+#       ~r{lib/awesome_web/templates/.*(eex)$}
+#     ]
+#   ]
 
 # Do not include metadata nor timestamps in development logs
 config :logger, :console, format: "[$level] $message\n"
@@ -78,5 +78,3 @@ config :awesome, Awesome.Fetcher,
   links_dets: 'links.dets',
   awesome_path: "h4cc/awesome-elixir",
   readme: "/contents/README.md"
-
-import_config "dev.secret.exs"
